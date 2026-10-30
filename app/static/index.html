@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Media Metadata Editor</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px system-ui, sans-serif; display: flex; height: 100vh; color: #222; }
+  #left { width: 340px; border-right: 1px solid #ccc; display: flex; flex-direction: column; }
+  #right { flex: 1; overflow: auto; padding: 16px 24px; }
+  #pathbar { display: flex; gap: 4px; padding: 8px; }
+  #pathbar input { flex: 1; }
+  #list { flex: 1; overflow: auto; padding: 0 8px; }
+  .row { display: flex; gap: 6px; padding: 3px 4px; align-items: center; cursor: default; }
+  .row.dir { cursor: pointer; color: #0a58ca; }
+  .row.sel { background: #e7f1ff; }
+  .row label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #bar { padding: 8px; border-top: 1px solid #ccc; display: flex; gap: 8px; align-items: center; }
+  fieldset { margin: 0 0 16px; border: 1px solid #ccc; border-radius: 6px; }
+  legend { font-weight: 600; padding: 0 6px; }
+  .f { display: grid; grid-template-columns: 220px 1fr; gap: 8px; margin: 6px 0; align-items: start; }
+  .f input, .f textarea { width: 100%; padding: 4px; font: inherit; }
+  .f.dirty input, .f.dirty textarea { background: #fff8d6; }
+  button { padding: 5px 12px; }
+  .primary { background: #0a58ca; color: #fff; border: 0; border-radius: 4px; }
+  .primary:disabled { background: #999; }
+  .err { color: #b00020; }
+  .muted { color: #666; }
+  dialog { width: min(900px, 92vw); max-height: 85vh; }
+  table { border-collapse: collapse; width: 100%; }
+  td, th { border-bottom: 1px solid #ddd; padding: 3px 6px; text-align: left; vertical-align: top; }
+  .old { color: #b00020; text-decoration: line-through; }
+  .new { color: #0a7a2f; }
+</style>
+</head>
+<body>
+<div id="left">
+  <div id="pathbar">
+    <button id="openFiles" class="primary" title="Open files with the standard Windows dialog">Open files…</button>
+    <button id="openFolder" title="Choose a folder">Open folder…</button>
+  </div>
+  <div id="pathbar">
+    <button id="up" title="Parent folder / drive list">↑</button>
+    <input id="path" placeholder="Folder path">
+    <button id="go">Go</button>
+  </div>
+  <div id="list"></div>
+  <div id="bar">
+    <button id="all">Select all</button>
+    <button id="none">None</button>
+    <span id="count" class="muted"></span>
+  </div>
+</div>
+<div id="right">
+  <div id="editor"><p class="muted">Select one or more files to edit. Select several for bulk editing of the fields they share.</p></div>
+</div>
+<dialog id="dlg">
+  <h3>Review changes</h3>
+  <div id="dlgBody"></div>
+  <label><input type="checkbox" id="backup" checked> Create timestamped .bak copies before writing</label>
+  <div style="margin-top:12px;display:flex;gap:8px;justify-content:flex-end">
+    <button id="cancel">Cancel</button>
+    <button id="confirm" class="primary">Apply</button>
+  </div>
+</dialog>
+<script>
+const $ = id => document.getElementById(id);
+const state = { dir: "", dirs: [], files: [], selected: new Set(), records: [], dirty: {} };
+
+function h(tag, props = {}, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (k === "class") e.className = v; else if (k.startsWith("on")) e.addEventListener(k.slice(2), v); else e[k] = v;
+  }
+  for (const k of kids) e.append(k);
+  return e;
+}
+async function api(url, body) {
+  const r = await fetch(url, body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {});
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
+  return r.json();
+}
+const sep = () => (state.dir.includes("\\") ? "\\" : "/");
+const full = name => state.dir.replace(/[\\/]$/, "") + sep() + name;
+
+async function browse(path) {
+  try {
+    const d = await api("/api/browse?path=" + encodeURIComponent(path || ""));
+    Object.assign(state, { dir: d.path, parent: d.parent, dirs: d.dirs, files: d.files, drives: d.drives || [] });
+    state.selected.clear(); state.records = []; state.dirty = {};
+    $("path").value = d.drives ? "" : d.path;
+    renderList(); renderEditor();
+  } catch (e) { alert(e.message); }
+}
+
+function renderList() {
+  const list = $("list"); list.replaceChildren();
+  for (const d of state.drives || []) list.append(h("div", { class: "row dir", onclick: () => browse(d) }, "💽 " + d));
+  for (const d of state.dirs) list.append(h("div", { class: "row dir", onclick: () => browse(full(d)) }, "📁 " + d));
+  for (const f of state.files) {
+    const p = full(f);
+    const cb = h("input", { type: "checkbox", checked: state.selected.has(p), onchange: () => toggle(p, cb.checked) });
+    list.append(h("div", { class: "row" + (state.selected.has(p) ? " sel" : "") }, cb, h("label", { title: f, onclick: () => { cb.checked = !cb.checked; toggle(p, cb.checked); } }, f)));
+  }
+  $("count").textContent = state.selected.size + " selected";
+}
+let loadTimer;
+function toggle(p, on) {
+  on ? state.selected.add(p) : state.selected.delete(p);
+  renderList(); clearTimeout(loadTimer); loadTimer = setTimeout(loadSelected, 150);
+}
+async function loadSelected() {
+  state.dirty = {};
+  state.records = state.selected.size ? await api("/api/read", { paths: [...state.selected] }) : [];
+  renderEditor();
+}
+
+function renderEditor() {
+  const ed = $("editor"); ed.replaceChildren();
+  const recs = state.records;
+  if (!recs.length) { ed.append(h("p", { class: "muted" }, "Select one or more files to edit.")); return; }
+  const good = recs.filter(r => !r.error);
+  recs.filter(r => r.error).forEach(r => ed.append(h("p", { class: "err" }, `${r.name}: ${r.error}`)));
+  if (!good.length) return;
+  const formats = [...new Set(good.map(r => r.format))];
+  ed.append(h("h2", {}, good.length === 1 ? good[0].name : `Bulk edit — ${good.length} files`),
+            h("p", { class: "muted" }, formats.join(" · ")));
+  if (good.length > 1) ed.append(h("p", { class: "muted" }, "Only fields supported by every selected file are shown. Untouched fields are left alone; clear a field to remove it."));
+
+  const shared = good[0].schema.filter(f => good.every(r => r.schema.some(s => s.key === f.key)));
+  const groups = {};
+  for (const f of shared) (groups[f.group] ||= []).push(f);
+  for (const [g, fields] of Object.entries(groups)) {
+    const fs = h("fieldset", {}, h("legend", {}, g));
+    for (const f of fields) fs.append(fieldRow(f, good));
+    ed.append(fs);
+  }
+  ed.append(h("button", { class: "primary", id: "review", onclick: review }, "Review changes…"),
+            h("button", { onclick: loadSelected, style: "margin-left:8px" }, "Reset"));
+  updateReview();
+}
+function fieldRow(f, recs) {
+  const values = [...new Set(recs.map(r => r.fields[f.key] ?? ""))];
+  const multi = values.length > 1;
+  const multiline = ["common.comment", "bext.coding_history", "bext.description", "ixml.NOTE", "xmp.description"].includes(f.key);
+  const input = h(multiline ? "textarea" : "input", { value: multi ? "" : values[0], placeholder: multi ? "‹multiple values›" : "", rows: 3 });
+  const row = h("div", { class: "f" }, h("label", {}, f.label), input);
+  input.addEventListener("input", () => {
+    const original = multi ? null : values[0];
+    if (input.value === original || (multi && input.value === "" && !(f.key in state.dirty && state.dirty[f.key] === ""))) {
+      delete state.dirty[f.key]; row.classList.remove("dirty");
+    } else { state.dirty[f.key] = input.value; row.classList.add("dirty"); }
+    updateReview();
+  });
+  if (multi) input.addEventListener("dblclick", () => { input.value = ""; state.dirty[f.key] = ""; row.classList.add("dirty"); input.placeholder = "(will be cleared)"; updateReview(); });
+  return row;
+}
+function updateReview() { const b = $("review"); if (b) b.disabled = !Object.keys(state.dirty).length; }
+
+async function review() {
+  const paths = state.records.filter(r => !r.error).map(r => r.path);
+  const prev = await api("/api/preview", { paths, changes: state.dirty });
+  const body = $("dlgBody"); body.replaceChildren();
+  let total = 0;
+  for (const p of prev) {
+    body.append(h("h4", {}, p.name));
+    if (p.error) { body.append(h("p", { class: "err" }, p.error)); continue; }
+    if (!p.diffs.length) { body.append(h("p", { class: "muted" }, "No changes.")); continue; }
+    total += p.diffs.length;
+    const t = h("table", {}, h("tr", {}, h("th", {}, "Field"), h("th", {}, "Before"), h("th", {}, "After")));
+    for (const d of p.diffs) t.append(h("tr", {}, h("td", {}, d.key), h("td", { class: "old" }, d.before), h("td", { class: "new" }, d.after || "(removed)")));
+    body.append(t);
+  }
+  $("confirm").disabled = !total;
+  $("dlg").showModal();
+}
+$("cancel").onclick = () => $("dlg").close();
+$("confirm").onclick = async () => {
+  const paths = state.records.filter(r => !r.error).map(r => r.path);
+  $("confirm").disabled = true;
+  try {
+    const res = await api("/api/apply", { paths, changes: state.dirty, backup: $("backup").checked });
+    const body = $("dlgBody"); body.replaceChildren(h("h4", {}, "Results"));
+    res.forEach(r => body.append(h("p", { class: r.ok ? "" : "err" }, r.ok ? `✔ ${r.name}: ${r.written} field(s) written` : `✘ ${r.name}: ${r.error}`)));
+    $("confirm").style.display = "none"; $("cancel").textContent = "Close";
+    $("cancel").onclick = () => { $("dlg").close(); $("confirm").style.display = ""; $("cancel").textContent = "Cancel"; $("cancel").onclick = () => $("dlg").close(); loadSelected(); };
+  } catch (e) { alert(e.message); $("confirm").disabled = false; }
+};
+
+async function pick(mode) {
+  const btns = [$("openFiles"), $("openFolder")];
+  btns.forEach(b => b.disabled = true);
+  try {
+    const { paths } = await api("/api/pick", { mode });
+    if (!paths.length) return;
+    if (mode === "folder") return browse(paths[0]);
+    const dir = paths[0].replace(/[\\/][^\\/]*$/, "");
+    await browse(dir.length === 2 && dir[1] === ":" ? dir + "\\" : dir);
+    for (const p of paths) {
+      const name = p.split(/[\\/]/).pop();
+      if (state.files.includes(name)) state.selected.add(full(name));
+    }
+    renderList(); await loadSelected();
+  } catch (e) { alert(e.message); }
+  finally { btns.forEach(b => b.disabled = false); }
+}
+$("openFiles").onclick = () => pick("files");
+$("openFolder").onclick = () => pick("folder");
+$("go").onclick = () => browse($("path").value);
+$("path").onkeydown = e => { if (e.key === "Enter") browse($("path").value); };
+// At a drive root the parent equals the path itself, so go to the drive list.
+$("up").onclick = () => browse(state.parent === state.dir ? "::drives::" : state.parent);
+$("all").onclick = () => { state.files.forEach(f => state.selected.add(full(f))); renderList(); loadSelected(); };
+$("none").onclick = () => { state.selected.clear(); renderList(); loadSelected(); };
+browse("");
+</script>
+</body>
+</html>
